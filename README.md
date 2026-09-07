@@ -23,7 +23,7 @@ This Magisk/KernelSU module acts as a seamless bridge between your Android devic
 1. Download the latest `BootCreator-vX.X.zip` from the **[Releases](../../releases)** tab.
 2. Flash the module.
 3. **Reboot** your device.
-4. Open the [Boot Animation Studio Website](https://lumii55.github.io/boot_animation_studio/)* on your phone or PC
+4. Open the [Boot Animation Studio Website](https://lumii55.github.io/boot_animation_studio/) on your phone or PC
 6. Click **"Connect to Phone"**, allow the prompt on your device's screen, and start creating!
 
 ## Uninstallation
