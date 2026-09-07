@@ -1,0 +1,17 @@
+boot_server
+
+*.class
+classes.dex
+*.apk
+*.jar
+
+debug.keystore
+
+*.log
+saved_paths.txt
+temp_paths.txt
+history/
+backup/
+custom/
+
+*.zip

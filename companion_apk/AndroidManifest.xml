@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.bootcreator.companion"
+    android:versionCode="3"
+    android:versionName="1.2">
+    
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    
+    <!-- ✨ A permissão pra desenhar o Toast Fofo em qualquer lugar! ✨ -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    
+    <application android:usesCleartextTraffic="true" android:label="Boot Creator" android:theme="@android:style/Theme.DeviceDefault.Light.Dialog.NoActionBar">
+        <activity android:name="com.bootcreator.companion.PromptActivity"
+            android:exported="true" android:excludeFromRecents="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+        </activity>
+
+        <receiver android:name="com.bootcreator.companion.ToastReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="com.bootcreator.SHOW_TOAST" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
