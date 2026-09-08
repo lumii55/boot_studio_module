@@ -1,6 +1,6 @@
-### 🎉 Boot Studio Module first release
-* The first official release of the Companion Module is here!
+### Minor changes update 🔧
 
 **Changelog:**
 
-* Initial release!
+* The module now automatically deletes old logs at each boot.
+* When a new animation is applied, the module will create a system.prop file in an attempt to enable sound during boot in ROMs where it is disabled by default.
