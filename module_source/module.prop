@@ -4,3 +4,4 @@ version=v1.0
 versionCode=1
 author=Lumii
 description=Just a bridge between the phone and the website
+updateJson=https://raw.githubusercontent.com/lumii55/boot_studio_module/refs/heads/main/update.json
