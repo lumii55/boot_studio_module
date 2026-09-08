@@ -1,5 +1,4 @@
 #!/system/bin/sh
-# clean.sh
 
 MODDIR=${0%/*}
 CACHE_FILE="$MODDIR/saved_paths.txt"
@@ -19,6 +18,8 @@ while read -r TARGET_PATH; do
         rm -f "$MODDIR$TARGET_PATH"
     fi
 done < "$CACHE_FILE"
+
+rm -f "$MODDIR/system.prop"
 
 cmd notification post -t "✨ Boot Creator" "tag" "Animation removed! 🧹 Reboot to restore original!"
 
