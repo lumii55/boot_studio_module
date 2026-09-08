@@ -1,6 +1,6 @@
 ### 🎉 Boot Studio Module first release
 * The first official release of the Companion Module is here!
 
-Changelog:
+**Changelog:**
 
-Initial release!
+* Initial release!
