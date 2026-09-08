@@ -1,5 +1,4 @@
 #!/system/bin/sh
-# inject.sh
 
 MODDIR=${0%/*}
 CACHE_FILE="$MODDIR/saved_paths.txt"
@@ -17,22 +16,22 @@ while read -r TARGET_PATH; do
             *) TARGET_PATH="/$TARGET_PATH" ;;
         esac
         
-        
         TARGET_DIR=$(dirname "$TARGET_PATH")
         mkdir -p "$MODDIR$TARGET_DIR"
         
         cp "$NEW_ZIP" "$MODDIR$TARGET_PATH"
         
-        
         chcon u:object_r:system_file:s0 "$MODDIR$TARGET_PATH" 2>/dev/null
     fi
 done < "$CACHE_FILE"
 
+echo "persist.sys.bootanim.play_sound=1" > "$MODDIR/system.prop"
+echo "ro.bootanim.set_volume=1" >> "$MODDIR/system.prop"
+chmod 644 "$MODDIR/system.prop"
 
 chown -R 0:0 "$MODDIR"
 
 find "$MODDIR" -type d -exec chmod 755 {} \;
-
 find "$MODDIR" -type f -exec chmod 644 {} \;
 
 chmod 755 "$MODDIR/inject.sh"
@@ -43,4 +42,4 @@ rm -f "$NEW_ZIP"
 
 cmd notification post -S bigtext -t "✨ Boot Creator" "tag" "Injection successful! Reboot to see your new animation!"
 
-echo "Success! Directory paths unlocked and Magic Mount applied!"
+echo "Success! Directory paths unlocked, Magic Mount applied and sound enabled!"
