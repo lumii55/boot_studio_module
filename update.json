@@ -2,5 +2,5 @@
   "version": "v1.0",
   "versionCode": 1,
   "zipUrl": "https://github.com/lumii55/boot_studio_module/releases/download/v1.0/BootStudioModule-v1.0.zip",
-  "changelog": "https://github.com/lumii55/boot_studio_module/releases/latest"
+  "changelog": "https://raw.githubusercontent.com/lumii55/boot_studio_module/refs/heads/main/changelog.md"
 }
