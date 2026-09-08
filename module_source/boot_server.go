@@ -333,7 +333,7 @@ func resetHandler(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
-        cmd := exec.Command("/system/bin/sh", "-c", "rm -f "+ModDir+"/saved_paths.txt && rm -rf "+ModDir+"/system "+ModDir+"/product "+ModDir+"/oem "+ModDir+"/vendor "+ModDir+"/system_ext "+ModDir+"/apex "+ModDir+"/custom "+ModDir+"/history")
+        cmd := exec.Command("/system/bin/sh", "-c", "rm -f "+ModDir+"/saved_paths.txt "+ModDir+"/system.prop "+ModDir+"/boot_creator.log && rm -rf "+ModDir+"/system "+ModDir+"/product "+ModDir+"/oem "+ModDir+"/vendor "+ModDir+"/system_ext "+ModDir+"/apex "+ModDir+"/custom "+ModDir+"/history")
         if err := cmd.Run(); err != nil {
                 fmt.Fprintf(w, `{"status": "error", "message": "Error resetting the module!"}`)
                 writeLog("Error: Failed to reset the module directories.")
