@@ -1,5 +1,4 @@
 #!/system/bin/sh
-# Late_start service script
 
 MODDIR=${0%/*}
 LOGFILE="$MODDIR/boot_creator.log"
@@ -11,6 +10,8 @@ until [ "$(getprop sys.boot_completed)" = "1" ]; do
 done
 
 sleep 3
+
+rm -f "$LOGFILE"
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOGFILE"
