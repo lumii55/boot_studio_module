@@ -27,7 +27,7 @@
 - Prevented multiple boot animation test sessions from running simultaneously.
 - Improved session invalidation when disconnecting.
 
-🐛 Bug Fixes
+### 🐛 Bug Fixes
 
 - History previews are now stored correctly as ".webm" files instead of WebM data using a ".gif" extension.
 - Maintained compatibility with legacy ".gif" history previews created by previous versions.
@@ -38,7 +38,7 @@
 - Removed an overly broad recursive permission change that could modify unrelated module files.
 - Troubleshoot/Reset now correctly removes both current and previous diagnostic logs.
 
-🛠️ Stability & Diagnostics
+### 🛠️ Stability & Diagnostics
 
 - Improved error handling during boot animation injection.
 - Improved validation before applying animation files.
