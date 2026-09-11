@@ -2,8 +2,12 @@
 
 MODDIR=${0%/*}
 LOGFILE="$MODDIR/boot_creator.log"
+PREVIOUS_LOGFILE="$MODDIR/boot_creator.previous.log"
 CACHE_FILE="$MODDIR/saved_paths.txt"
 TEMP_LIST="$MODDIR/temp_paths.txt"
+PKG_NAME="com.bootcreator.companion"
+APK_PATH="$MODDIR/companion.apk"
+EXPECTED_COMPANION_VERSION=4
 
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
     sleep 1
@@ -11,7 +15,10 @@ done
 
 sleep 3
 
-rm -f "$LOGFILE"
+if [ -f "$LOGFILE" ]; then
+    mv -f "$LOGFILE" "$PREVIOUS_LOGFILE"
+fi
+: > "$LOGFILE"
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOGFILE"
@@ -20,15 +27,14 @@ log_msg() {
 log_msg "--- ✨ Boot Creator Module Started ✨ ---"
 
 if [ -f "$CACHE_FILE" ]; then
-    log_msg "Cache found! Reading file..."
+    log_msg "Cache found. Reading file..."
     while read -r p; do
         log_msg "Path loaded from cache: $p"
     done < "$CACHE_FILE"
 else
     log_msg "Cache not found. Looking for bootanimation.zip"
-    
     rm -f "$TEMP_LIST"
-    
+
     log_msg "[Step 1] Checking priority paths..."
     for P in /apex/com.android.bootanimation/etc/bootanimation.zip \
              /product/media/bootanimation.zip \
@@ -40,21 +46,19 @@ else
             log_msg "[Step 1] Found: $P"
         fi
     done
-    
+
     log_msg "[Step 2] Searching in system folders..."
     find /system /vendor /product /oem /odm /system_ext /apex -maxdepth 4 -type f -name "bootanimation.zip" 2>/dev/null >> "$TEMP_LIST"
-    
+
     if [ -f "$TEMP_LIST" ]; then
         sort -u "$TEMP_LIST" > "$CACHE_FILE"
         rm -f "$TEMP_LIST"
     fi
-    
+
     if [ -s "$CACHE_FILE" ]; then
-        log_msg "[Step 1 & 2] Success! Paths successfully found and saved to cache!"
+        log_msg "[Step 1 & 2] Paths found and saved to cache."
     else
-        log_msg "Failed. No bootanimation found anywhere!"
-        
-        log_msg "[Step 3] Activating recovery mode..."
+        log_msg "No bootanimation was found. Activating recovery paths."
         echo "/system/media/bootanimation.zip" > "$CACHE_FILE"
         echo "/product/media/bootanimation.zip" >> "$CACHE_FILE"
         echo "/oem/media/bootanimation.zip" >> "$CACHE_FILE"
@@ -75,23 +79,32 @@ while read -r TARGET_PATH; do
     fi
 done < "$CACHE_FILE"
 
-log_msg "Waking up the server on port 4040..."
+INSTALLED_VERSION="$(dumpsys package "$PKG_NAME" 2>/dev/null | sed -n 's/.*versionCode=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
 
-chmod +x $MODDIR/boot_server
-nohup $MODDIR/boot_server > /dev/null 2>&1 &
-
-PKG_NAME="com.bootcreator.companion"
-APK_PATH="$MODDIR/companion.apk"
-
-if ! pm list packages | grep -q "$PKG_NAME"; then
-    log_msg "Companion APK not found. Installing APK..."
-    pm install -r "$APK_PATH"
-    log_msg "APK installed successfully!"
+if [ "$INSTALLED_VERSION" != "$EXPECTED_COMPANION_VERSION" ]; then
+    log_msg "Installing or updating companion APK..."
+    if pm install -r "$APK_PATH" >/dev/null 2>&1; then
+        log_msg "Companion APK installation completed."
+    else
+        log_msg "Failed to install companion APK."
+    fi
 fi
 
-log_msg "Granting overlay and notification permissions..."
+INSTALLED_VERSION="$(dumpsys package "$PKG_NAME" 2>/dev/null | sed -n 's/.*versionCode=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+
+if [ "$INSTALLED_VERSION" != "$EXPECTED_COMPANION_VERSION" ]; then
+    log_msg "Companion APK version mismatch. Secure server will remain disabled."
+    exit 0
+fi
+
+log_msg "Companion APK is up to date."
+log_msg "Granting companion permissions..."
 appops set "$PKG_NAME" SYSTEM_ALERT_WINDOW allow
 appops set "$PKG_NAME" TOAST_WINDOW allow
 pm grant "$PKG_NAME" android.permission.POST_NOTIFICATIONS 2>/dev/null
 
-log_msg "All set! Waiting for orders from the website!"
+log_msg "Starting secure server on port 4040..."
+chmod 755 "$MODDIR/boot_server"
+nohup "$MODDIR/boot_server" > /dev/null 2>&1 &
+
+log_msg "All set. Waiting for requests from the website."
