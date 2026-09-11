@@ -6,18 +6,29 @@ cat << 'XML_EOF' > AndroidManifest.xml
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.bootcreator.companion"
-    android:versionCode="4"
-    android:versionName="1.3">
+    android:versionCode="6"
+    android:versionName="1.5">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
-    <application android:usesCleartextTraffic="true" android:label="Boot Creator" android:theme="@android:style/Theme.DeviceDefault.Light.Dialog.NoActionBar">
+    <application android:usesCleartextTraffic="true" android:label="Boot Animation Studio Module" android:theme="@android:style/Theme.DeviceDefault.Light.Dialog.NoActionBar">
         <activity android:name="com.bootcreator.companion.PromptActivity"
             android:exported="true" android:excludeFromRecents="true" android:noHistory="true" android:permission="android.permission.DUMP">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+        </activity>
+
+
+        <activity android:name="com.bootcreator.companion.PairActivity"
+            android:exported="true" android:excludeFromRecents="true" android:noHistory="true">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="bootstudio" android:host="pair" />
             </intent-filter>
         </activity>
 
@@ -52,6 +63,11 @@ if [ ! -f "debug.keystore" ]; then
     keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
 fi
 apksigner sign --ks debug.keystore --ks-pass pass:android --out companion.apk companion_unsigned.apk
+
+if [ -d "../module_source" ]; then
+    cp -f companion.apk ../module_source/companion.apk
+    echo "📦 Companion APK copied to module_source."
+fi
 
 echo "📲 Installing companion APK..."
 su -c "cp '$PWD/companion.apk' /data/local/tmp/boot_creator_companion.apk && pm install -r /data/local/tmp/boot_creator_companion.apk && appops set com.bootcreator.companion SYSTEM_ALERT_WINDOW allow"
