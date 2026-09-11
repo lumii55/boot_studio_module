@@ -1,7 +1,7 @@
 id=boot_creator
 name=Boot Animation Studio Module
-version=v1.2
-versionCode=3
+version=v1.3
+versionCode=4
 author=Lumii
 description=Just a bridge between the phone and the website
 updateJson=https://raw.githubusercontent.com/lumii55/boot_studio_module/refs/heads/main/update.json
