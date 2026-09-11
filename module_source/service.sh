@@ -7,7 +7,7 @@ CACHE_FILE="$MODDIR/saved_paths.txt"
 TEMP_LIST="$MODDIR/temp_paths.txt"
 PKG_NAME="com.bootcreator.companion"
 APK_PATH="$MODDIR/companion.apk"
-EXPECTED_COMPANION_VERSION=4
+EXPECTED_COMPANION_VERSION=6
 
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
     sleep 1
@@ -100,7 +100,6 @@ fi
 log_msg "Companion APK is up to date."
 log_msg "Granting companion permissions..."
 appops set "$PKG_NAME" SYSTEM_ALERT_WINDOW allow
-appops set "$PKG_NAME" TOAST_WINDOW allow
 pm grant "$PKG_NAME" android.permission.POST_NOTIFICATIONS 2>/dev/null
 
 log_msg "Starting secure server on port 4040..."
