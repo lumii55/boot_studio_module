@@ -1,481 +1,1070 @@
 package main
 
 import (
-        "encoding/json"
-        "fmt"
-        "io"
-        "net"
-        "net/http"
-        "os"
-        "os/exec"
-        "sort"
-        "strings"
-        "time"
+	"archive/zip"
+	"bufio"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
-const ModDir = "/data/adb/modules/boot_creator"
+const (
+	ModDir                 = "/data/adb/modules/boot_creator"
+	maxRequestBytes        = 32 << 20
+	maxBootAnimationBytes  = 25 << 20
+	maxPreviewBytes        = 6 << 20
+	maxZipUncompressedSize = 512 << 20
+)
 
 var (
-        pairedIP         = ""
-        authInProgress   = false
-        deviceModel      = "Unknown Device"
-        deviceResolution = "Unknown"
-        authChan         = make(chan bool, 1)
+	deviceModel       = "Unknown Device"
+	deviceResolution  = "Unknown"
+	stateMu           sync.RWMutex
+	pairedIP          string
+	pairedToken       string
+	pendingAuth       *authRequest
+	previewMu         sync.Mutex
+	previewActive     bool
+	historyIDPattern  = regexp.MustCompile(`^[0-9]{10,19}$`)
+	resolutionPattern = regexp.MustCompile(`[0-9]+x[0-9]+`)
 )
 
-func init() {
-        out, err := exec.Command("/system/bin/getprop", "ro.product.model").Output()
-        if err == nil {
-                deviceModel = strings.TrimSpace(string(out))
-        }
+type authRequest struct {
+	nonce  string
+	result chan bool
+}
 
-        resOut, resErr := exec.Command("/system/bin/sh", "-c", "wm size | grep -oE '[0-9]+x[0-9]+' | tail -n 1").Output()
-        if resErr == nil {
-                res := strings.TrimSpace(string(resOut))
-                if res != "" {
-                        deviceResolution = res
-                }
-        }
+type statusResponse struct {
+	Status     string `json:"status"`
+	Model      string `json:"model,omitempty"`
+	Resolution string `json:"resolution,omitempty"`
+	HasCustom  bool   `json:"has_custom,omitempty"`
+	Token      string `json:"token,omitempty"`
+	Message    string `json:"message,omitempty"`
+}
+
+func init() {
+	out, err := exec.Command("/system/bin/getprop", "ro.product.model").Output()
+	if err == nil {
+		model := strings.TrimSpace(string(out))
+		if model != "" {
+			deviceModel = model
+		}
+	}
+
+	resOut, resErr := exec.Command("/system/bin/wm", "size").Output()
+	if resErr == nil {
+		matches := resolutionPattern.FindAllString(string(resOut), -1)
+		if len(matches) > 0 {
+			deviceResolution = matches[len(matches)-1]
+		}
+	}
 }
 
 func writeLog(message string) {
-        logPath := ModDir + "/boot_creator.log"
-        f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-        if err != nil {
-                return
-        }
-        defer f.Close()
-        
-        timestamp := time.Now().Format("2006-01-02 15:04:05")
-        logEntry := fmt.Sprintf("[%s] %s\n", timestamp, message)
-        f.WriteString(logEntry)
+	logPath := ModDir + "/boot_creator.log"
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	_, _ = f.WriteString(fmt.Sprintf("[%s] %s\n", timestamp, message))
 }
 
 func showToast(msg string) {
-        go func() {
-                cmd := fmt.Sprintf(`am broadcast -a com.bootcreator.SHOW_TOAST -n com.bootcreator.companion/.ToastReceiver -e msg "%s"`, msg)
-                exec.Command("/system/bin/sh", "-c", cmd).Run()
-        }()
+	go func() {
+		_ = exec.Command(
+			"/system/bin/am",
+			"broadcast",
+			"-a", "com.bootcreator.SHOW_TOAST",
+			"-n", "com.bootcreator.companion/.ToastReceiver",
+			"-e", "msg", msg,
+		).Run()
+	}()
 }
 
-func enableCORS(w *http.ResponseWriter) {
-        (*w).Header().Set("Access-Control-Allow-Origin", "*")
-        (*w).Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
-        (*w).Header().Set("Access-Control-Allow-Headers", "Content-Type")
-        (*w).Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-        (*w).Header().Set("Pragma", "no-cache")
-        (*w).Header().Set("Expires", "0")
+func writeJSON(w http.ResponseWriter, statusCode int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func isAllowedOrigin(origin string) bool {
+	if origin == "" {
+		return true
+	}
+
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+
+	if u.Scheme == "https" && u.Hostname() == "lumii55.github.io" {
+		return true
+	}
+
+	if u.Scheme == "http" {
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func originDisplayLabel(origin string) string {
+	if origin == "https://lumii55.github.io" {
+		return origin
+	}
+
+	u, err := url.Parse(origin)
+	if err == nil && u.Scheme == "http" {
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return u.Scheme + "://" + host
+		}
+	}
+
+	return "Local-client"
+}
+
+func prepareRequest(w http.ResponseWriter, r *http.Request, allowedMethods ...string) bool {
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
+	origin := r.Header.Get("Origin")
+	if origin != "" {
+		if !isAllowedOrigin(origin) {
+			http.Error(w, "Origin not allowed", http.StatusForbidden)
+			return false
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Vary", "Origin")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Boot-Creator-Token")
+		w.Header().Set("Access-Control-Allow-Methods", strings.Join(allowedMethods, ", ")+
+			", OPTIONS")
+		if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+			w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		}
+	}
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return false
+	}
+
+	for _, method := range allowedMethods {
+		if r.Method == method {
+			return true
+		}
+	}
+
+	w.Header().Set("Allow", strings.Join(allowedMethods, ", "))
+	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	return false
 }
 
 func getIP(r *http.Request) string {
-        host, _, err := net.SplitHostPort(r.RemoteAddr)
-        if err != nil {
-                return r.RemoteAddr
-        }
-        return host
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+func secureEqual(a, b string) bool {
+	if len(a) == 0 || len(a) != len(b) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+func randomToken(size int) (string, error) {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func isAuthorized(r *http.Request) bool {
+	clientIP := getIP(r)
+	token := r.Header.Get("X-Boot-Creator-Token")
+
+	stateMu.RLock()
+	valid := pairedIP != "" && pairedIP == clientIP && secureEqual(pairedToken, token)
+	stateMu.RUnlock()
+
+	return valid
+}
+
+func requireAuthorization(w http.ResponseWriter, r *http.Request) bool {
+	if isAuthorized(r) {
+		return true
+	}
+	writeJSON(w, http.StatusUnauthorized, statusResponse{Status: "error", Message: "Access denied"})
+	return false
 }
 
 func checkHasCustomAnim() bool {
-        cacheFile := ModDir + "/saved_paths.txt"
-        data, err := os.ReadFile(cacheFile)
-        if err != nil {
-                return false
-        }
+	paths, err := readSavedPaths()
+	if err != nil {
+		return false
+	}
 
-        paths := strings.Split(strings.TrimSpace(string(data)), "\n")
-        for _, p := range paths {
-                p = strings.TrimSpace(p)
-                if p == "" {
-                        continue
-                }
+	for _, targetPath := range paths {
+		if info, err := os.Stat(ModDir + targetPath); err == nil && !info.IsDir() {
+			return true
+		}
+	}
 
-                if info, err := os.Stat(ModDir + p); err == nil && !info.IsDir() {
-                        return true
-                }
-        }
+	return false
+}
 
-        return false
+func readSavedPaths() ([]string, error) {
+	data, err := os.ReadFile(ModDir + "/saved_paths.txt")
+	if err != nil {
+		return nil, err
+	}
+
+	var paths []string
+	for _, raw := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		targetPath := strings.TrimSpace(raw)
+		if targetPath == "" {
+			continue
+		}
+		cleaned, ok := validateTargetPath(targetPath)
+		if ok {
+			paths = append(paths, cleaned)
+		}
+	}
+
+	if len(paths) == 0 {
+		return nil, errors.New("no valid paths")
+	}
+
+	return paths, nil
+}
+
+func validateTargetPath(targetPath string) (string, bool) {
+	if !strings.HasPrefix(targetPath, "/") || strings.ContainsRune(targetPath, '\x00') {
+		return "", false
+	}
+
+	cleaned := filepath.Clean(targetPath)
+	if cleaned != targetPath || !strings.HasSuffix(cleaned, "/bootanimation.zip") {
+		return "", false
+	}
+
+	return cleaned, true
 }
 
 func pingHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodGet) {
+		return
+	}
 
-        clientIP := getIP(r)
-        if pairedIP != clientIP {
-                fmt.Fprintf(w, `{"status": "auth_required"}`)
-                return
-        }
+	if !isAuthorized(r) {
+		writeJSON(w, http.StatusOK, statusResponse{Status: "auth_required"})
+		return
+	}
 
-        hasCustom := checkHasCustomAnim()
-        fmt.Fprintf(w, `{"status": "ok", "model": "%s", "resolution": "%s", "has_custom": %t}`, deviceModel, deviceResolution, hasCustom)
+	writeJSON(w, http.StatusOK, statusResponse{
+		Status:     "ok",
+		Model:      deviceModel,
+		Resolution: deviceResolution,
+		HasCustom:  checkHasCustomAnim(),
+	})
 }
 
 func requestAuthHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodPost) {
+		return
+	}
 
-        if authInProgress {
-                fmt.Fprintf(w, `{"status": "busy"}`)
-                return
-        }
+	clientIP := getIP(r)
+	origin := r.Header.Get("Origin")
+	nonce, err := randomToken(24)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not create authorization request"})
+		writeLog("Error: Failed to generate authorization nonce.")
+		return
+	}
 
-        authInProgress = true
-        defer func() { authInProgress = false }()
+	request := &authRequest{
+		nonce:  nonce,
+		result: make(chan bool, 1),
+	}
 
-        exec.Command("su", "2000", "-c", "am start -n com.bootcreator.companion/.PromptActivity").Run()
+	stateMu.Lock()
+	if pendingAuth != nil {
+		stateMu.Unlock()
+		writeJSON(w, http.StatusConflict, statusResponse{Status: "busy"})
+		return
+	}
+	pendingAuth = request
+	stateMu.Unlock()
 
-        select {
-        case allowed := <-authChan:
-                if allowed {
-                        pairedIP = getIP(r)
-                        hasCustom := checkHasCustomAnim()
-                        fmt.Fprintf(w, `{"status": "ok", "model": "%s", "resolution": "%s", "has_custom": %t}`, deviceModel, deviceResolution, hasCustom)
-                        showToast("✨ Boot Creator: Website connected successfully!")
-                        writeLog("Connection allowed by user from IP: " + pairedIP)
-                } else {
-                        fmt.Fprintf(w, `{"status": "denied"}`)
-                        showToast("❌ Boot Creator: Connection denied by user.")
-                        writeLog("Connection denied by user from IP: " + getIP(r))
-                }
-        case <-time.After(30 * time.Second):
-                fmt.Fprintf(w, `{"status": "timeout"}`)
-                writeLog("Connection prompt timed out for IP: " + getIP(r))
-        }
+	defer func() {
+		stateMu.Lock()
+		if pendingAuth == request {
+			pendingAuth = nil
+		}
+		stateMu.Unlock()
+	}()
+
+	originLabel := originDisplayLabel(origin)
+
+	command := "am start -n com.bootcreator.companion/.PromptActivity --es nonce " + nonce + " --es requester_ip " + clientIP + " --es request_origin " + originLabel
+	if err := exec.Command("su", "2000", "-c", command).Run(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not open authorization prompt"})
+		writeLog("Error: Failed to launch authorization prompt for IP: " + clientIP)
+		return
+	}
+
+	select {
+	case allowed := <-request.result:
+		if !allowed {
+			writeJSON(w, http.StatusForbidden, statusResponse{Status: "denied"})
+			showToast("❌ Boot Creator: Connection denied by user.")
+			writeLog("Connection denied by user from IP: " + clientIP)
+			return
+		}
+
+		token, err := randomToken(32)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not create session"})
+			writeLog("Error: Failed to generate session token for IP: " + clientIP)
+			return
+		}
+
+		stateMu.Lock()
+		pairedIP = clientIP
+		pairedToken = token
+		stateMu.Unlock()
+
+		writeJSON(w, http.StatusOK, statusResponse{
+			Status:     "ok",
+			Model:      deviceModel,
+			Resolution: deviceResolution,
+			HasCustom:  checkHasCustomAnim(),
+			Token:      token,
+		})
+		showToast("✨ Boot Creator: Website connected successfully!")
+		writeLog("Connection allowed by user from IP: " + clientIP)
+	case <-time.After(30 * time.Second):
+		writeJSON(w, http.StatusRequestTimeout, statusResponse{Status: "timeout"})
+		writeLog("Connection prompt timed out for IP: " + clientIP)
+	}
 }
 
 func authCallbackHandler(w http.ResponseWriter, r *http.Request) {
-        allow := r.URL.Query().Get("allow") == "true"
-        select { case <-authChan: default: }
-        authChan <- allow
-        fmt.Fprintf(w, "Received!")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	clientIP := net.ParseIP(getIP(r))
+	if clientIP == nil || !clientIP.IsLoopback() {
+		http.Error(w, "Access denied", http.StatusForbidden)
+		return
+	}
+
+	nonce := r.URL.Query().Get("nonce")
+	allowValue := r.URL.Query().Get("allow")
+	if nonce == "" || (allowValue != "true" && allowValue != "false") {
+		http.Error(w, "Invalid callback", http.StatusBadRequest)
+		return
+	}
+
+	stateMu.RLock()
+	request := pendingAuth
+	valid := request != nil && secureEqual(request.nonce, nonce)
+	stateMu.RUnlock()
+
+	if !valid {
+		http.Error(w, "Authorization request not found", http.StatusForbidden)
+		return
+	}
+
+	select {
+	case request.result <- allowValue == "true":
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "Authorization request already completed", http.StatusConflict)
+	}
 }
 
 func disconnectHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodPost) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
 
-        clientIP := getIP(r)
-        if pairedIP == clientIP {
-                pairedIP = ""
-                showToast("🔌 Boot Creator: Website disconnected.")
-                writeLog("Website disconnected manually by user.")
-        }
+	stateMu.Lock()
+	pairedIP = ""
+	pairedToken = ""
+	stateMu.Unlock()
 
-        fmt.Fprintf(w, `{"status": "disconnected"}`)
+	writeJSON(w, http.StatusOK, statusResponse{Status: "disconnected"})
+	showToast("🔌 Boot Creator: Website disconnected.")
+	writeLog("Website disconnected manually by user.")
 }
 
 func cleanHistory(dir string) {
-        entries, err := os.ReadDir(dir)
-        if err != nil {
-                return
-        }
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
 
-        var zips []string
-        for _, e := range entries {
-                if strings.HasSuffix(e.Name(), ".zip") {
-                        zips = append(zips, e.Name())
-                }
-        }
+	var zips []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".zip") {
+			zips = append(zips, entry.Name())
+		}
+	}
 
-        if len(zips) > 5 {
-                sort.Strings(zips)
-                for i := 0; i < len(zips)-5; i++ {
-                        base := strings.TrimSuffix(zips[i], ".zip")
-                        os.Remove(dir + "/" + base + ".zip")
-                        os.Remove(dir + "/" + base + ".gif")
-                }
-                showToast("🧹 Boot Creator: Automatic cleanup! Old animations were removed from history.")
-                writeLog("Automatic history cleanup performed. Oldest animations deleted.")
-        }
+	if len(zips) <= 5 {
+		return
+	}
+
+	sort.Strings(zips)
+	for i := 0; i < len(zips)-5; i++ {
+		base := strings.TrimSuffix(zips[i], ".zip")
+		_ = os.Remove(filepath.Join(dir, base+".zip"))
+		_ = os.Remove(filepath.Join(dir, base+".webm"))
+		_ = os.Remove(filepath.Join(dir, base+".gif"))
+	}
+	showToast("🧹 Boot Creator: Automatic cleanup removed old animations from history.")
+	writeLog("Automatic history cleanup performed. Oldest animations deleted.")
+}
+
+func newHistoryID(dir string) string {
+	id := time.Now().UnixMilli()
+	for {
+		candidate := strconv.FormatInt(id, 10)
+		if _, err := os.Stat(filepath.Join(dir, candidate+".zip")); os.IsNotExist(err) {
+			return candidate
+		}
+		id++
+	}
+}
+
+func copyFile(source, destination string, mode os.FileMode) error {
+	input, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer input.Close()
+
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+
+	_, copyErr := io.Copy(output, input)
+	closeErr := output.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func saveMultipartFile(file io.Reader, destination string, limit int64) error {
+	output, err := os.OpenFile(destination, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+
+	limited := io.LimitReader(file, limit+1)
+	written, copyErr := io.Copy(output, limited)
+	closeErr := output.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if written > limit {
+		_ = os.Remove(destination)
+		return errors.New("file too large")
+	}
+	return nil
+}
+
+func validateBootAnimation(zipPath string) error {
+	archive, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return errors.New("invalid zip file")
+	}
+	defer archive.Close()
+
+	if len(archive.File) == 0 || len(archive.File) > 10000 {
+		return errors.New("invalid zip contents")
+	}
+
+	var descFile *zip.File
+	hasImage := false
+	var totalUncompressed uint64
+
+	for _, entry := range archive.File {
+		name := strings.ReplaceAll(entry.Name, "\\", "/")
+		if strings.ContainsRune(name, '\x00') || strings.HasPrefix(name, "/") {
+			return errors.New("unsafe zip path")
+		}
+		for _, part := range strings.Split(name, "/") {
+			if part == ".." {
+				return errors.New("unsafe zip path")
+			}
+		}
+
+		totalUncompressed += entry.UncompressedSize64
+		if totalUncompressed > maxZipUncompressedSize {
+			return errors.New("zip expands beyond the allowed size")
+		}
+
+		if name == "desc.txt" {
+			descFile = entry
+		}
+
+		lower := strings.ToLower(name)
+		if strings.Contains(name, "/") && (strings.HasSuffix(lower, ".png") || strings.HasSuffix(lower, ".jpg") || strings.HasSuffix(lower, ".jpeg")) {
+			hasImage = true
+		}
+	}
+
+	if descFile == nil {
+		return errors.New("desc.txt not found")
+	}
+	if !hasImage {
+		return errors.New("no animation frames found")
+	}
+	if descFile.UncompressedSize64 > 64<<10 {
+		return errors.New("desc.txt is too large")
+	}
+
+	descReader, err := descFile.Open()
+	if err != nil {
+		return errors.New("could not read desc.txt")
+	}
+	defer descReader.Close()
+
+	scanner := bufio.NewScanner(descReader)
+	if !scanner.Scan() {
+		return errors.New("desc.txt is empty")
+	}
+
+	fields := strings.Fields(scanner.Text())
+	if len(fields) < 3 {
+		return errors.New("invalid desc.txt header")
+	}
+
+	width, widthErr := strconv.Atoi(fields[0])
+	height, heightErr := strconv.Atoi(fields[1])
+	fps, fpsErr := strconv.Atoi(fields[2])
+	if widthErr != nil || heightErr != nil || fpsErr != nil || width < 1 || height < 1 || fps < 1 || width > 16384 || height > 16384 || fps > 240 {
+		return errors.New("invalid desc.txt dimensions or fps")
+	}
+
+	return nil
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodPost) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
 
-        clientIP := getIP(r)
-        if pairedIP != clientIP || pairedIP == "" {
-                http.Error(w, "Access Denied", http.StatusUnauthorized)
-                return
-        }
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, statusResponse{Status: "error", Message: "Upload is too large or invalid"})
+		writeLog("Error: Upload rejected because the multipart request was too large or invalid.")
+		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
 
-        r.ParseMultipartForm(50 << 20)
-        file, _, err := r.FormFile("bootanimation")
-        if err != nil {
-                http.Error(w, "Failed to receive file", http.StatusBadRequest)
-                writeLog("Error: Failed to receive bootanimation.zip during upload.")
-                return
-        }
-        defer file.Close()
+	file, _, err := r.FormFile("bootanimation")
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, statusResponse{Status: "error", Message: "Failed to receive bootanimation.zip"})
+		writeLog("Error: Failed to receive bootanimation.zip during upload.")
+		return
+	}
+	defer file.Close()
 
-        tempPath := "/data/local/tmp/new_boot.zip"
-        tempFile, _ := os.Create(tempPath)
-        io.Copy(tempFile, file)
-        tempFile.Close()
+	tempFile, err := os.CreateTemp("/data/local/tmp", "boot_creator_upload_*.zip")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not create temporary file"})
+		writeLog("Error: Failed to create temporary upload file.")
+		return
+	}
+	tempPath := tempFile.Name()
+	_ = tempFile.Close()
+	defer os.Remove(tempPath)
 
-        historyDir := ModDir + "/history"
-        os.MkdirAll(historyDir, 0755)
+	if err := saveMultipartFile(file, tempPath, maxBootAnimationBytes); err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, statusResponse{Status: "error", Message: "bootanimation.zip exceeds the allowed size"})
+		writeLog("Error: bootanimation.zip exceeded the allowed upload size.")
+		return
+	}
 
-        timestamp := fmt.Sprintf("%d", time.Now().Unix())
-        historyZipPath := historyDir + "/" + timestamp + ".zip"
+	if err := validateBootAnimation(tempPath); err != nil {
+		writeJSON(w, http.StatusBadRequest, statusResponse{Status: "error", Message: err.Error()})
+		writeLog("Error: Invalid boot animation upload: " + err.Error())
+		return
+	}
 
-        exec.Command("/system/bin/sh", "-c", "cp "+tempPath+" "+historyZipPath).Run()
+	historyDir := ModDir + "/history"
+	if err := os.MkdirAll(historyDir, 0755); err != nil {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not prepare history"})
+		writeLog("Error: Failed to create history directory.")
+		return
+	}
 
-        previewFile, _, errPref := r.FormFile("preview")
-        if errPref == nil {
-                defer previewFile.Close()
-                prefOut, _ := os.Create(historyDir + "/" + timestamp + ".gif")
-                io.Copy(prefOut, previewFile)
-                prefOut.Close()
-        }
+	timestamp := newHistoryID(historyDir)
+	historyZipPath := filepath.Join(historyDir, timestamp+".zip")
+	if err := copyFile(tempPath, historyZipPath, 0644); err != nil {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not save history item"})
+		writeLog("Error: Failed to save boot animation to history.")
+		return
+	}
 
-        cleanHistory(historyDir)
+	previewPath := ""
+	previewFile, _, previewErr := r.FormFile("preview")
+	if previewErr == nil {
+		defer previewFile.Close()
+		previewPath = filepath.Join(historyDir, timestamp+".webm")
+		if err := saveMultipartFile(previewFile, previewPath, maxPreviewBytes); err != nil {
+			_ = os.Remove(previewPath)
+			previewPath = ""
+			writeLog("Warning: Preview file was rejected because it exceeded the allowed size.")
+		}
+	}
 
-        cmd := exec.Command("/system/bin/sh", ModDir+"/inject.sh", tempPath)
-        if cmd.Run() != nil {
-                fmt.Fprintf(w, `{"status": "error"}`)
-                showToast("❌ Boot Creator: Oops... An error occurred while injecting the ZIP!")
-                writeLog("Error: Failed to inject new boot animation via inject.sh.")
-        } else {
-                fmt.Fprintf(w, `{"status": "success"}`)
-                showToast("🚀 Boot Creator: New animation injected! Ready for the next boot!")
-                writeLog("Success: New boot animation injected and saved to history (ID: " + timestamp + ").")
-        }
+	cmd := exec.Command("/system/bin/sh", ModDir+"/inject.sh", tempPath)
+	if err := cmd.Run(); err != nil {
+		_ = os.Remove(historyZipPath)
+		if previewPath != "" {
+			_ = os.Remove(previewPath)
+		}
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Failed to inject boot animation"})
+		showToast("❌ Boot Creator: An error occurred while injecting the ZIP.")
+		writeLog("Error: Failed to inject new boot animation via inject.sh.")
+		return
+	}
+
+	cleanHistory(historyDir)
+	writeJSON(w, http.StatusOK, statusResponse{Status: "success"})
+	showToast("🚀 Boot Creator: New animation injected and ready for the next boot!")
+	writeLog("Success: New boot animation injected and saved to history (ID: " + timestamp + ").")
 }
 
 func removeHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        w.Header().Set("Content-Type", "application/json")
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodPost) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
 
-        clientIP := getIP(r)
-        if pairedIP != clientIP || pairedIP == "" {
-                http.Error(w, `{"status": "error", "message": "Access Denied"}`, http.StatusUnauthorized)
-                return
-        }
+	cmd := exec.Command("/system/bin/sh", ModDir+"/clean.sh")
+	if err := cmd.Run(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Error running clean.sh"})
+		writeLog("Error: Failed to run clean.sh during removal.")
+		return
+	}
 
-        cmd := exec.Command("/system/bin/sh", ModDir+"/clean.sh")
-        if err := cmd.Run(); err != nil {
-                fmt.Fprintf(w, `{"status": "error", "message": "Error running clean.sh!"}`)
-                writeLog("Error: Failed to run clean.sh during removal.")
-                return
-        }
-
-        fmt.Fprintf(w, `{"status": "success", "message": "Animation successfully removed!"}`)
-        showToast("🗑️ Boot Creator: Custom animation removed. Original boot restored!")
-        writeLog("Success: Custom boot animation removed. Restored to stock.")
+	writeJSON(w, http.StatusOK, statusResponse{Status: "success", Message: "Animation successfully removed"})
+	showToast("🗑️ Boot Creator: Custom animation removed. Original boot restored!")
+	writeLog("Success: Custom boot animation removed. Restored to stock.")
 }
 
 func pullHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodGet) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
 
-        clientIP := getIP(r)
-        if pairedIP != clientIP || pairedIP == "" {
-                http.Error(w, "Access Denied", http.StatusUnauthorized)
-                return
-        }
+	source := r.URL.Query().Get("source")
+	if source != "module" && source != "system" {
+		http.Error(w, "Invalid source", http.StatusBadRequest)
+		return
+	}
 
-        source := r.URL.Query().Get("source")
-        cacheFile := ModDir + "/saved_paths.txt"
-        data, err := os.ReadFile(cacheFile)
+	paths, err := readSavedPaths()
+	if err != nil {
+		http.Error(w, "No valid paths found", http.StatusNotFound)
+		writeLog("Error: Attempted to pull animation, but no valid saved paths were found.")
+		return
+	}
 
-        if err != nil {
-                http.Error(w, "No paths found", http.StatusNotFound)
-                writeLog("Error: Attempted to pull animation, but no saved paths were found.")
-                return
-        }
+	targetPath := paths[0]
+	fileToServe := targetPath
 
-        paths := strings.Split(strings.TrimSpace(string(data)), "\n")
-        if len(paths) == 0 || paths[0] == "" {
-                http.Error(w, "No paths saved", http.StatusNotFound)
-                return
-        }
+	if source == "module" {
+		fileToServe = ModDir + targetPath
+		showToast("📥 Boot Creator: The website extracted your custom animation from the module!")
+		writeLog("Animation pulled by website (Source: Module).")
+	} else {
+		backupPath := ModDir + "/backup" + targetPath
+		if _, err := os.Stat(backupPath); err == nil {
+			fileToServe = backupPath
+		}
+		showToast("📥 Boot Creator: The website extracted your stock animation!")
+		writeLog("Animation pulled by website (Source: Stock System).")
+	}
 
-        targetPath := paths[0]
-        fileToServe := targetPath
+	info, err := os.Stat(fileToServe)
+	if err != nil || info.IsDir() {
+		http.Error(w, "File not found", http.StatusNotFound)
+		writeLog("Error: Pulled animation file not found at " + fileToServe)
+		return
+	}
 
-        if source == "module" {
-                fileToServe = ModDir + targetPath
-                showToast("📥 Boot Creator: The website extracted your custom animation from the module!")
-                writeLog("Animation pulled by website (Source: Module).")
-        } else if source == "system" {
-                backupPath := ModDir + "/backup" + targetPath
-                if _, err := os.Stat(backupPath); err == nil {
-                        fileToServe = backupPath
-                } else {
-                        fileToServe = targetPath
-                }
-                showToast("📥 Boot Creator: The website extracted your stock animation!")
-                writeLog("Animation pulled by website (Source: Stock System).")
-        }
-
-        if _, err := os.Stat(fileToServe); os.IsNotExist(err) {
-                http.Error(w, "File not found physically", http.StatusNotFound)
-                writeLog("Error: Pulled animation file not found physically at " + fileToServe)
-                return
-        }
-
-        w.Header().Set("Content-Disposition", "attachment; filename=pulled_bootanimation.zip")
-        w.Header().Set("Content-Type", "application/zip")
-        http.ServeFile(w, r, fileToServe)
+	w.Header().Set("Content-Disposition", "attachment; filename=pulled_bootanimation.zip")
+	w.Header().Set("Content-Type", "application/zip")
+	http.ServeFile(w, r, fileToServe)
 }
 
 func resetHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        w.Header().Set("Content-Type", "application/json")
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodPost) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
 
-        clientIP := getIP(r)
-        if pairedIP != clientIP || pairedIP == "" {
-                http.Error(w, `{"status": "error", "message": "Access Denied"}`, http.StatusUnauthorized)
-                return
-        }
+	files := []string{
+		ModDir + "/saved_paths.txt",
+		ModDir + "/system.prop",
+		ModDir + "/boot_creator.log",
+		ModDir + "/boot_creator.previous.log",
+	}
+	dirs := []string{
+		ModDir + "/system",
+		ModDir + "/product",
+		ModDir + "/oem",
+		ModDir + "/vendor",
+		ModDir + "/system_ext",
+		ModDir + "/apex",
+		ModDir + "/custom",
+		ModDir + "/history",
+	}
 
-        cmd := exec.Command("/system/bin/sh", "-c", "rm -f "+ModDir+"/saved_paths.txt "+ModDir+"/system.prop "+ModDir+"/boot_creator.log && rm -rf "+ModDir+"/system "+ModDir+"/product "+ModDir+"/oem "+ModDir+"/vendor "+ModDir+"/system_ext "+ModDir+"/apex "+ModDir+"/custom "+ModDir+"/history")
-        if err := cmd.Run(); err != nil {
-                fmt.Fprintf(w, `{"status": "error", "message": "Error resetting the module!"}`)
-                writeLog("Error: Failed to reset the module directories.")
-                return
-        }
+	for _, filePath := range files {
+		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+			writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Error resetting the module"})
+			writeLog("Error: Failed to reset module file: " + filePath)
+			return
+		}
+	}
 
-        fmt.Fprintf(w, `{"status": "success", "message": "Module reset successfully!"}`)
-        showToast("⚠️ Boot Creator: Module has been reset (Troubleshoot).")
-        writeLog("Success: Module troubleshooting reset executed. History cleared.")
+	for _, dirPath := range dirs {
+		if err := os.RemoveAll(dirPath); err != nil {
+			writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Error resetting the module"})
+			writeLog("Error: Failed to reset module directory: " + dirPath)
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, statusResponse{Status: "success", Message: "Module reset successfully"})
+	showToast("⚠️ Boot Creator: Module has been reset for troubleshooting.")
+	writeLog("Success: Module troubleshooting reset executed. History cleared.")
+}
+
+func validHistoryID(id string) bool {
+	return historyIDPattern.MatchString(id)
 }
 
 func historyListHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        w.Header().Set("Content-Type", "application/json")
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodGet) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
 
-        historyDir := ModDir + "/history"
-        entries, _ := os.ReadDir(historyDir)
+	historyDir := ModDir + "/history"
+	entries, err := os.ReadDir(historyDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, http.StatusOK, []string{})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not read history"})
+		return
+	}
 
-        var ids []string
-        for _, e := range entries {
-                if strings.HasSuffix(e.Name(), ".zip") {
-                        ids = append(ids, strings.TrimSuffix(e.Name(), ".zip"))
-                }
-        }
+	var ids []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".zip") {
+			continue
+		}
+		id := strings.TrimSuffix(entry.Name(), ".zip")
+		if validHistoryID(id) {
+			ids = append(ids, id)
+		}
+	}
 
-        sort.Sort(sort.Reverse(sort.StringSlice(ids)))
-        json.NewEncoder(w).Encode(ids)
+	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
+	writeJSON(w, http.StatusOK, ids)
 }
 
 func historyPreviewHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodGet) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
 
-        id := r.URL.Query().Get("id")
-        path := ModDir + "/history/" + id + ".gif"
+	id := r.URL.Query().Get("id")
+	if !validHistoryID(id) {
+		http.Error(w, "Invalid history ID", http.StatusBadRequest)
+		return
+	}
 
-        w.Header().Set("Cache-Control", "max-age=86400")
-        http.ServeFile(w, r, path)
+	previewPath := filepath.Join(ModDir, "history", id+".webm")
+	info, err := os.Stat(previewPath)
+	if err != nil || info.IsDir() {
+		previewPath = filepath.Join(ModDir, "history", id+".gif")
+		info, err = os.Stat(previewPath)
+	}
+	if err != nil || info.IsDir() {
+		http.Error(w, "Preview not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	w.Header().Set("Content-Type", "video/webm")
+	http.ServeFile(w, r, previewPath)
 }
 
 func historyApplyHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        w.Header().Set("Content-Type", "application/json")
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodPost) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
 
-        id := r.URL.Query().Get("id")
-        path := ModDir + "/history/" + id + ".zip"
-        tempPath := "/data/local/tmp/apply_history.zip"
+	id := r.URL.Query().Get("id")
+	if !validHistoryID(id) {
+		writeJSON(w, http.StatusBadRequest, statusResponse{Status: "error", Message: "Invalid history ID"})
+		return
+	}
 
-        exec.Command("/system/bin/sh", "-c", "cp "+path+" "+tempPath).Run()
+	historyPath := filepath.Join(ModDir, "history", id+".zip")
+	if info, err := os.Stat(historyPath); err != nil || info.IsDir() {
+		writeJSON(w, http.StatusNotFound, statusResponse{Status: "error", Message: "History item not found"})
+		return
+	}
 
-        cmd := exec.Command("/system/bin/sh", ModDir+"/inject.sh", tempPath)
-        if cmd.Run() != nil {
-                fmt.Fprintf(w, `{"status": "error", "message": "Error injecting history!"}`)
-                writeLog("Error: Failed to restore animation from history (ID: " + id + ").")
-        } else {
-                fmt.Fprintf(w, `{"status": "success", "message": "Animation restored from the past! ✨"}`)
-                showToast("⏳ Boot Creator: Past animation restored successfully!")
-                writeLog("Success: Animation restored from history (ID: " + id + ").")
-        }
+	tempFile, err := os.CreateTemp("/data/local/tmp", "boot_creator_history_*.zip")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not create temporary file"})
+		return
+	}
+	tempPath := tempFile.Name()
+	_ = tempFile.Close()
+	defer os.Remove(tempPath)
+
+	if err := copyFile(historyPath, tempPath, 0600); err != nil {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not prepare history item"})
+		writeLog("Error: Failed to prepare history item for restore (ID: " + id + ").")
+		return
+	}
+
+	cmd := exec.Command("/system/bin/sh", ModDir+"/inject.sh", tempPath)
+	if err := cmd.Run(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Error injecting history"})
+		writeLog("Error: Failed to restore animation from history (ID: " + id + ").")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, statusResponse{Status: "success", Message: "Animation restored from history"})
+	showToast("⏳ Boot Creator: Past animation restored successfully!")
+	writeLog("Success: Animation restored from history (ID: " + id + ").")
 }
 
 func historyDeleteHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        w.Header().Set("Content-Type", "application/json")
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodPost) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
 
-        id := r.URL.Query().Get("id")
-        os.Remove(ModDir + "/history/" + id + ".zip")
-        os.Remove(ModDir + "/history/" + id + ".gif")
+	id := r.URL.Query().Get("id")
+	if !validHistoryID(id) {
+		writeJSON(w, http.StatusBadRequest, statusResponse{Status: "error", Message: "Invalid history ID"})
+		return
+	}
 
-        fmt.Fprintf(w, `{"status": "success"}`)
-        showToast("🧹 Boot Creator: An old animation was deleted from the vault.")
-        writeLog("History item deleted manually by user (ID: " + id + ").")
+	zipPath := filepath.Join(ModDir, "history", id+".zip")
+	previewWebMPath := filepath.Join(ModDir, "history", id+".webm")
+	previewLegacyPath := filepath.Join(ModDir, "history", id+".gif")
+	removed := false
+
+	if err := os.Remove(zipPath); err == nil {
+		removed = true
+	} else if !os.IsNotExist(err) {
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not delete history item"})
+		return
+	}
+
+	for _, previewPath := range []string{previewWebMPath, previewLegacyPath} {
+		if err := os.Remove(previewPath); err != nil && !os.IsNotExist(err) {
+			writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not delete history preview"})
+			return
+		}
+	}
+
+	if !removed {
+		writeJSON(w, http.StatusNotFound, statusResponse{Status: "error", Message: "History item not found"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, statusResponse{Status: "success"})
+	showToast("🧹 Boot Creator: An old animation was deleted from history.")
+	writeLog("History item deleted manually by user (ID: " + id + ").")
+}
+
+func acquirePreview() bool {
+	previewMu.Lock()
+	defer previewMu.Unlock()
+	if previewActive {
+		return false
+	}
+	previewActive = true
+	return true
+}
+
+func releasePreview() {
+	previewMu.Lock()
+	previewActive = false
+	previewMu.Unlock()
 }
 
 func testAnimHandler(w http.ResponseWriter, r *http.Request) {
-        enableCORS(&w)
-        w.Header().Set("Content-Type", "application/json")
-        if r.Method == "OPTIONS" { return }
+	if !prepareRequest(w, r, http.MethodPost) {
+		return
+	}
+	if !requireAuthorization(w, r) {
+		return
+	}
+	if !acquirePreview() {
+		writeJSON(w, http.StatusConflict, statusResponse{Status: "busy", Message: "A preview is already running"})
+		return
+	}
 
-        clientIP := getIP(r)
-        if pairedIP != clientIP || pairedIP == "" {
-                http.Error(w, `{"status": "error", "message": "Access Denied"}`, http.StatusUnauthorized)
-                return
-        }
+	paths, err := readSavedPaths()
+	if err != nil {
+		releasePreview()
+		writeJSON(w, http.StatusNotFound, statusResponse{Status: "error", Message: "No valid saved path found"})
+		return
+	}
 
-        cacheFile := ModDir + "/saved_paths.txt"
-        data, err := os.ReadFile(cacheFile)
-        if err != nil {
-                fmt.Fprintf(w, `{"status": "error", "message": "No saved path found!"}`)
-                return
-        }
-        
-        paths := strings.Split(strings.TrimSpace(string(data)), "\n")
-        if len(paths) == 0 || paths[0] == "" {
-                fmt.Fprintf(w, `{"status": "error", "message": "No saved path found!"}`)
-                return
-        }
-        
-        targetPath := strings.TrimSpace(paths[0])
-        modulePath := ModDir + targetPath 
+	targetPath := paths[0]
+	modulePath := ModDir + targetPath
+	if info, err := os.Stat(modulePath); err != nil || info.IsDir() {
+		releasePreview()
+		writeJSON(w, http.StatusNotFound, statusResponse{Status: "error", Message: "Custom animation not found in module"})
+		return
+	}
+	if info, err := os.Stat(targetPath); err != nil || info.IsDir() {
+		releasePreview()
+		writeJSON(w, http.StatusNotFound, statusResponse{Status: "error", Message: "System animation path not found"})
+		return
+	}
 
-        exec.Command("/system/bin/sh", "-c", "umount "+targetPath).Run()
-        exec.Command("/system/bin/sh", "-c", "mount -o bind "+modulePath+" "+targetPath).Run()
-        exec.Command("/system/bin/sh", "-c", "setprop ctl.start bootanim").Run()
+	_ = exec.Command("/system/bin/umount", targetPath).Run()
+	if err := exec.Command("/system/bin/mount", "-o", "bind", modulePath, targetPath).Run(); err != nil {
+		releasePreview()
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not mount preview animation"})
+		writeLog("Error: Failed to bind mount preview animation.")
+		return
+	}
+	if err := exec.Command("/system/bin/setprop", "ctl.start", "bootanim").Run(); err != nil {
+		_ = exec.Command("/system/bin/umount", targetPath).Run()
+		releasePreview()
+		writeJSON(w, http.StatusInternalServerError, statusResponse{Status: "error", Message: "Could not start boot animation preview"})
+		writeLog("Error: Failed to start boot animation preview.")
+		return
+	}
 
-        showToast("👀 Boot Creator: Showing Magic Preview... Look at your screen!")
-        writeLog("Preview triggered on device using bind mount.")
+	showToast("👀 Boot Creator: Showing device preview. Look at your screen!")
+	writeLog("Preview triggered on device using bind mount.")
 
-        go func() {
-                time.Sleep(15 * time.Second) 
-                exec.Command("/system/bin/sh", "-c", "setprop ctl.stop bootanim").Run()
-                time.Sleep(1 * time.Second)
-                exec.Command("/system/bin/sh", "-c", "umount "+targetPath).Run()
-                showToast("🏁 Boot Creator: Preview finished!")
-                writeLog("Preview finished and unmounted.")
-        }()
+	go func() {
+		defer releasePreview()
+		time.Sleep(15 * time.Second)
+		_ = exec.Command("/system/bin/setprop", "ctl.stop", "bootanim").Run()
+		time.Sleep(1 * time.Second)
+		_ = exec.Command("/system/bin/umount", targetPath).Run()
+		showToast("🏁 Boot Creator: Preview finished!")
+		writeLog("Preview finished and unmounted.")
+	}()
 
-        fmt.Fprintf(w, `{"status": "success", "message": "Look at your phone!"}`)
+	writeJSON(w, http.StatusOK, statusResponse{Status: "success", Message: "Preview started"})
 }
 
 func main() {
-        writeLog("=== Boot Creator Server Started ===")
+	writeLog("=== Boot Creator Server Started ===")
 
-        http.HandleFunc("/ping", pingHandler)
-        http.HandleFunc("/request_auth", requestAuthHandler)
-        http.HandleFunc("/auth_callback", authCallbackHandler)
-        http.HandleFunc("/disconnect", disconnectHandler)
-        http.HandleFunc("/upload", uploadHandler)
-        http.HandleFunc("/remove", removeHandler)
-        http.HandleFunc("/pull", pullHandler)
-        http.HandleFunc("/reset", resetHandler)
+	http.HandleFunc("/ping", pingHandler)
+	http.HandleFunc("/request_auth", requestAuthHandler)
+	http.HandleFunc("/auth_callback", authCallbackHandler)
+	http.HandleFunc("/disconnect", disconnectHandler)
+	http.HandleFunc("/upload", uploadHandler)
+	http.HandleFunc("/remove", removeHandler)
+	http.HandleFunc("/pull", pullHandler)
+	http.HandleFunc("/reset", resetHandler)
+	http.HandleFunc("/history/list", historyListHandler)
+	http.HandleFunc("/history/preview", historyPreviewHandler)
+	http.HandleFunc("/history/apply", historyApplyHandler)
+	http.HandleFunc("/history/delete", historyDeleteHandler)
+	http.HandleFunc("/test_anim", testAnimHandler)
 
-        http.HandleFunc("/history/list", historyListHandler)
-        http.HandleFunc("/history/preview", historyPreviewHandler)
-        http.HandleFunc("/history/apply", historyApplyHandler)
-        http.HandleFunc("/history/delete", historyDeleteHandler)
+	server := &http.Server{
+		Addr:              "0.0.0.0:4040",
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       90 * time.Second,
+		WriteTimeout:      90 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
 
-        http.HandleFunc("/test_anim", testAnimHandler)
-
-        fmt.Println("✨ Boot Creator server running on port 4040...")
-        http.ListenAndServe("0.0.0.0:4040", nil)
+	fmt.Println("✨ Boot Creator server running on port 4040...")
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		writeLog("Server stopped with error: " + err.Error())
+	}
 }
