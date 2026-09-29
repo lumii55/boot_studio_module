@@ -20,27 +20,29 @@ public class PairActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         Uri data = getIntent().getData();
-        token = data == null ? null : data.getQueryParameter("token");
+        boolean validLink = data != null
+                && "bootstudio".equals(data.getScheme())
+                && "pair".equals(data.getHost())
+                && (data.getPath() == null || data.getPath().isEmpty() || "/".equals(data.getPath()));
+        token = validLink ? data.getQueryParameter("token") : null;
         if (token == null || !TOKEN_PATTERN.matcher(token).matches()) {
-            Toast.makeText(this, "Invalid Boot Animation Studio pairing link.", Toast.LENGTH_LONG).show();
+            Toast.makeText(this, L10n.get(this, "pair_invalid"), Toast.LENGTH_LONG).show();
             finish();
             return;
         }
 
         String code = token.substring(0, 3).toUpperCase() + "-" + token.substring(token.length() - 3).toUpperCase();
-        String message = "A browser is waiting to pair with this phone.\n\nPairing code: " + code
-                + "\n\nOnly continue if you just scanned a QR code shown by Boot Animation Studio on your other device."
-                + "\n\nThis approval expires automatically.";
+        String message = L10n.get(this, "pair_message", code);
 
         new AlertDialog.Builder(this)
-                .setTitle("Pair Boot Animation Studio")
+                .setTitle(L10n.get(this, "pair_title"))
                 .setMessage(message)
-                .setPositiveButton("PAIR", new DialogInterface.OnClickListener() {
+                .setPositiveButton(L10n.get(this, "pair"), new DialogInterface.OnClickListener() {
                     public void onClick(DialogInterface dialog, int which) {
                         approvePairing();
                     }
                 })
-                .setNegativeButton("CANCEL", new DialogInterface.OnClickListener() {
+                .setNegativeButton(L10n.get(this, "cancel"), new DialogInterface.OnClickListener() {
                     public void onClick(DialogInterface dialog, int which) {
                         finish();
                     }
@@ -79,7 +81,7 @@ public class PairActivity extends Activity {
                         public void run() {
                             if (!result) {
                                 getSharedPreferences("pairing", MODE_PRIVATE).edit().clear().apply();
-                                Toast.makeText(PairActivity.this, "Could not reach the Boot Animation Studio module server.", Toast.LENGTH_LONG).show();
+                                Toast.makeText(PairActivity.this, L10n.get(PairActivity.this, "pair_server_error"), Toast.LENGTH_LONG).show();
                             }
                             finish();
                         }

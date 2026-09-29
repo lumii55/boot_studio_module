@@ -32,12 +32,21 @@ public class ToastReceiver extends BroadcastReceiver {
         }
 
         String rawMessage = intent.getStringExtra("msg");
-        if (rawMessage == null || rawMessage.trim().isEmpty()) {
+        String messageKey = intent.getStringExtra("key");
+        if ((rawMessage == null || rawMessage.trim().isEmpty()) && (messageKey == null || messageKey.trim().isEmpty())) {
             return;
         }
 
         Context appContext = context.getApplicationContext();
-        String message = cleanMessage(rawMessage);
+        String message;
+        if (messageKey != null && !messageKey.trim().isEmpty()) {
+            String arg0 = intent.getStringExtra("arg0");
+            String localizedArg0 = "permission".equals(intent.getStringExtra("arg0_type")) ? L10n.permission(appContext, arg0) : arg0;
+            String localized = localizedArg0 == null ? L10n.get(appContext, messageKey) : L10n.get(appContext, messageKey, localizedArg0);
+            message = (localized == null || localized.equals(messageKey)) ? cleanMessage(rawMessage) : localized;
+        } else {
+            message = cleanMessage(rawMessage);
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(appContext)) {
             showFallback(appContext, message);
@@ -54,7 +63,7 @@ public class ToastReceiver extends BroadcastReceiver {
 
         dismissCurrent(false);
 
-        VisualStyle style = resolveStyle(rawMessage);
+        VisualStyle style = resolveStyle((rawMessage == null ? "" : rawMessage) + " " + (messageKey == null ? "" : messageKey));
         LinearLayout card = createCard(appContext, message, style);
         int windowType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
