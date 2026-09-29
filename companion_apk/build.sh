@@ -1,74 +1,87 @@
 #!/data/data/com.termux/files/usr/bin/bash
-set -e
+set -euo pipefail
 
-echo "📜 Updating AndroidManifest.xml..."
-cat << 'XML_EOF' > AndroidManifest.xml
-<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.bootcreator.companion"
-    android:versionCode="6"
-    android:versionName="1.5">
+BUILD_ONLY="${BAS_BUILD_ONLY:-0}"
+ALLOW_NEW_KEY="${BAS_ALLOW_NEW_KEY:-0}"
+CACHE_DIR="${BAS_COMPANION_CACHE_DIR:-$HOME/.cache/boot-animation-studio-companion}"
+ANDROID_JAR="${BAS_ANDROID_JAR:-$CACHE_DIR/android-28.jar}"
+KEYSTORE="${BAS_KEYSTORE:-$PWD/debug.keystore}"
+BUILD_DIR="$PWD/.build"
+CLASSES_DIR="$BUILD_DIR/classes"
+DEX_DIR="$BUILD_DIR/dex"
+UNSIGNED_APK="$BUILD_DIR/companion_unsigned.apk"
+OUTPUT_APK="$PWD/companion.apk"
 
-    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
-    <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+fail() {
+    printf 'ERROR: %s\n' "$1" >&2
+    exit 1
+}
 
-    <application android:usesCleartextTraffic="true" android:label="Boot Animation Studio Module" android:theme="@android:style/Theme.DeviceDefault.Light.Dialog.NoActionBar">
-        <activity android:name="com.bootcreator.companion.PromptActivity"
-            android:exported="true" android:excludeFromRecents="true" android:noHistory="true" android:permission="android.permission.DUMP">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-            </intent-filter>
-        </activity>
+need() {
+    command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
+}
 
+for cmd in bash curl unzip javac d8 aapt keytool apksigner mkdir rm cp; do
+    need "$cmd"
+done
 
-        <activity android:name="com.bootcreator.companion.PairActivity"
-            android:exported="true" android:excludeFromRecents="true" android:noHistory="true">
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
-                <data android:scheme="bootstudio" android:host="pair" />
-            </intent-filter>
-        </activity>
+[ -f AndroidManifest.xml ] || fail "AndroidManifest.xml is missing."
+compgen -G 'src/com/bootcreator/companion/*.java' >/dev/null || fail "Companion Java sources are missing."
 
-        <receiver android:name="com.bootcreator.companion.ToastReceiver" android:exported="true" android:permission="android.permission.DUMP">
-            <intent-filter>
-                <action android:name="com.bootcreator.SHOW_TOAST" />
-            </intent-filter>
-        </receiver>
-    </application>
-</manifest>
-XML_EOF
+mkdir -p "$CACHE_DIR"
+if [ ! -f "$ANDROID_JAR" ]; then
+    printf 'Downloading Android 9 platform jar...\n'
+    PLATFORM_ZIP="$CACHE_DIR/platform-28.zip"
+    rm -f "$PLATFORM_ZIP"
+    curl -fL --retry 3 --retry-delay 2 -o "$PLATFORM_ZIP" "https://dl.google.com/android/repository/platform-28_r06.zip"
+    unzip -p "$PLATFORM_ZIP" "android-9/android.jar" > "$ANDROID_JAR"
+    rm -f "$PLATFORM_ZIP"
+fi
+[ -s "$ANDROID_JAR" ] || fail "android.jar is missing or empty: $ANDROID_JAR"
 
-if [ ! -f "android.jar" ]; then
-    echo "📥 Downloading android.jar..."
-    curl -L -o platform.zip "https://dl.google.com/android/repository/platform-28_r06.zip"
-    unzip -j platform.zip "android-9/android.jar" -d .
-    rm platform.zip
+if [ ! -f "$KEYSTORE" ]; then
+    [ "$ALLOW_NEW_KEY" = "1" ] || fail "Signing key not found: $KEYSTORE. Set BAS_KEYSTORE or explicitly set BAS_ALLOW_NEW_KEY=1."
+    mkdir -p "$(dirname "$KEYSTORE")"
+    printf 'Creating a new companion signing key...\n'
+    keytool -genkeypair -v -keystore "$KEYSTORE" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+    chmod 600 "$KEYSTORE"
 fi
 
-echo "☕ Compiling Java sources..."
-javac -source 1.8 -target 1.8 -cp android.jar -d . src/com/bootcreator/companion/*.java
+rm -rf "$BUILD_DIR" "$OUTPUT_APK"
+mkdir -p "$CLASSES_DIR" "$DEX_DIR"
 
-echo "⚡ Converting classes to DEX..."
-d8 --lib android.jar --output . com/bootcreator/companion/*.class
+printf 'Compiling Java sources...\n'
+javac -source 1.8 -target 1.8 -cp "$ANDROID_JAR" -d "$CLASSES_DIR" src/com/bootcreator/companion/*.java
 
-echo "📦 Packaging APK..."
-aapt package -f -M AndroidManifest.xml -I android.jar -F companion_unsigned.apk
-aapt add companion_unsigned.apk classes.dex > /dev/null
+printf 'Converting classes to DEX...\n'
+d8 --lib "$ANDROID_JAR" --output "$DEX_DIR" "$CLASSES_DIR"/com/bootcreator/companion/*.class
+[ -s "$DEX_DIR/classes.dex" ] || fail "classes.dex was not generated."
 
-echo "🔑 Signing APK..."
-if [ ! -f "debug.keystore" ]; then
-    keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+printf 'Packaging APK...\n'
+aapt package -f -M AndroidManifest.xml -I "$ANDROID_JAR" -F "$UNSIGNED_APK"
+(
+    cd "$DEX_DIR"
+    aapt add "$UNSIGNED_APK" classes.dex >/dev/null
+)
+
+printf 'Signing APK...\n'
+apksigner sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android --out "$OUTPUT_APK" "$UNSIGNED_APK"
+apksigner verify "$OUTPUT_APK" >/dev/null
+[ -s "$OUTPUT_APK" ] || fail "companion.apk was not generated."
+
+if [ "$BUILD_ONLY" = "1" ]; then
+    printf 'Companion APK built successfully (build-only mode).\n'
+    exit 0
 fi
-apksigner sign --ks debug.keystore --ks-pass pass:android --out companion.apk companion_unsigned.apk
 
 if [ -d "../module_source" ]; then
-    cp -f companion.apk ../module_source/companion.apk
-    echo "📦 Companion APK copied to module_source."
+    cp -f "$OUTPUT_APK" ../module_source/companion.apk
 fi
 
-echo "📲 Installing companion APK..."
-su -c "cp '$PWD/companion.apk' /data/local/tmp/boot_creator_companion.apk && pm install -r /data/local/tmp/boot_creator_companion.apk && appops set com.bootcreator.companion SYSTEM_ALERT_WINDOW allow"
-echo "✅ Companion APK installed successfully."
+for cmd in su pm appops; do
+    need "$cmd"
+done
+
+printf 'Installing companion APK...\n'
+su -c "cp '$OUTPUT_APK' /data/local/tmp/boot_creator_companion.apk && pm install -r /data/local/tmp/boot_creator_companion.apk && appops set com.bootcreator.companion SYSTEM_ALERT_WINDOW allow"
+printf 'Companion APK installed successfully.\n'
