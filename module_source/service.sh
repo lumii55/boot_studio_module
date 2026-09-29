@@ -4,10 +4,13 @@ MODDIR=${0%/*}
 LOGFILE="$MODDIR/boot_creator.log"
 PREVIOUS_LOGFILE="$MODDIR/boot_creator.previous.log"
 CACHE_FILE="$MODDIR/saved_paths.txt"
-TEMP_LIST="$MODDIR/temp_paths.txt"
+SCHEMA_FILE="$MODDIR/.paths_schema"
+ENV_FILE="$MODDIR/.paths_environment"
 PKG_NAME="com.bootcreator.companion"
 APK_PATH="$MODDIR/companion.apk"
-EXPECTED_COMPANION_VERSION=6
+EXPECTED_COMPANION_VERSION=7
+
+. "$MODDIR/path_utils.sh" || exit 0
 
 until [ "$(getprop sys.boot_completed)" = "1" ]; do
     sleep 1
@@ -26,58 +29,74 @@ log_msg() {
 
 log_msg "--- ✨ Boot Creator Module Started ✨ ---"
 
-if [ -f "$CACHE_FILE" ]; then
-    log_msg "Cache found. Reading file..."
-    while read -r p; do
-        log_msg "Path loaded from cache: $p"
-    done < "$CACHE_FILE"
-else
-    log_msg "Cache not found. Looking for bootanimation.zip"
-    rm -f "$TEMP_LIST"
-
-    log_msg "[Step 1] Checking priority paths..."
-    for P in /apex/com.android.bootanimation/etc/bootanimation.zip \
-             /product/media/bootanimation.zip \
-             /oem/media/bootanimation.zip \
-             /system_ext/media/bootanimation.zip \
-             /system/media/bootanimation.zip; do
-        if [ -f "$P" ]; then
-            echo "$P" >> "$TEMP_LIST"
-            log_msg "[Step 1] Found: $P"
-        fi
-    done
-
-    log_msg "[Step 2] Searching in system folders..."
-    find /system /vendor /product /oem /odm /system_ext /apex -maxdepth 4 -type f -name "bootanimation.zip" 2>/dev/null >> "$TEMP_LIST"
-
-    if [ -f "$TEMP_LIST" ]; then
-        sort -u "$TEMP_LIST" > "$CACHE_FILE"
-        rm -f "$TEMP_LIST"
-    fi
-
-    if [ -s "$CACHE_FILE" ]; then
-        log_msg "[Step 1 & 2] Paths found and saved to cache."
-    else
-        log_msg "No bootanimation was found. Activating recovery paths."
-        echo "/system/media/bootanimation.zip" > "$CACHE_FILE"
-        echo "/product/media/bootanimation.zip" >> "$CACHE_FILE"
-        echo "/oem/media/bootanimation.zip" >> "$CACHE_FILE"
-        echo "/system_ext/media/bootanimation.zip" >> "$CACHE_FILE"
-        echo "/apex/com.android.bootanimation/etc/bootanimation.zip" >> "$CACHE_FILE"
-    fi
+NEEDS_RESCAN=0
+if ! saved_paths_are_valid "$CACHE_FILE"; then
+    NEEDS_RESCAN=1
+elif [ "$(cat "$SCHEMA_FILE" 2>/dev/null)" != "$PATH_SCHEMA_VERSION" ]; then
+    NEEDS_RESCAN=1
 fi
 
+if [ "$NEEDS_RESCAN" -eq 1 ]; then
+    log_msg "Path cache is missing, invalid or outdated. Running path scan..."
+    if /system/bin/sh "$MODDIR/rescan_paths.sh"; then
+        log_msg "Path scan completed successfully."
+    else
+        log_msg "Path scan failed. Secure server will remain disabled."
+        exit 0
+    fi
+else
+    log_msg "Valid path cache found."
+    PATH_ENV_STATUS="$(path_environment_status "$ENV_FILE")"
+    case "$PATH_ENV_STATUS" in
+        changed)
+            log_msg "System build changed since the last path scan. Keeping cached paths and recommending a manual rescan."
+            ;;
+        unknown)
+            if write_path_environment_marker "$ENV_FILE"; then
+                log_msg "Path environment baseline initialized for this build."
+            else
+                log_msg "Warning: Could not initialize path environment baseline."
+            fi
+            ;;
+        *)
+            log_msg "Path environment matches the last scan."
+            ;;
+    esac
+fi
+
+while IFS= read -r TARGET_PATH || [ -n "$TARGET_PATH" ]; do
+    [ -n "$TARGET_PATH" ] || continue
+    if is_valid_bootanimation_path "$TARGET_PATH"; then
+        log_msg "Path loaded from cache: $TARGET_PATH"
+    fi
+done < "$CACHE_FILE"
+
 log_msg "Verifying backups in the vault..."
-while read -r TARGET_PATH; do
-    if [ -n "$TARGET_PATH" ] && [ -f "$TARGET_PATH" ]; then
+while IFS= read -r TARGET_PATH || [ -n "$TARGET_PATH" ]; do
+    [ -n "$TARGET_PATH" ] || continue
+    is_valid_bootanimation_path "$TARGET_PATH" || continue
+    if [ -f "$TARGET_PATH" ]; then
         BACKUP_PATH="$MODDIR/backup$TARGET_PATH"
         if [ ! -f "$BACKUP_PATH" ]; then
             mkdir -p "$(dirname "$BACKUP_PATH")"
-            cp "$TARGET_PATH" "$BACKUP_PATH"
-            log_msg "Backup created for: $TARGET_PATH"
+            if cp "$TARGET_PATH" "$BACKUP_PATH"; then
+                chmod 600 "$BACKUP_PATH" 2>/dev/null
+                log_msg "Backup created for: $TARGET_PATH"
+            else
+                log_msg "Warning: Failed to create backup for: $TARGET_PATH"
+            fi
         fi
     fi
 done < "$CACHE_FILE"
+
+if [ -f "$MODDIR/boot_server" ]; then
+    chmod 755 "$MODDIR/boot_server" 2>/dev/null
+    if "$MODDIR/boot_server" --prepare-rotation-after-boot >/dev/null 2>&1; then
+        log_msg "Boot rotation post-boot preparation checked."
+    else
+        log_msg "Warning: Boot rotation could not prepare the next animation. See module log for details."
+    fi
+fi
 
 INSTALLED_VERSION="$(dumpsys package "$PKG_NAME" 2>/dev/null | sed -n 's/.*versionCode=\([0-9][0-9]*\).*/\1/p' | head -n 1)"
 
