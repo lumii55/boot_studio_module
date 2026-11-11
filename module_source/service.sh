@@ -121,8 +121,62 @@ log_msg "Granting companion permissions..."
 appops set "$PKG_NAME" SYSTEM_ALERT_WINDOW allow
 pm grant "$PKG_NAME" android.permission.POST_NOTIFICATIONS 2>/dev/null
 
-log_msg "Starting secure server on port 4040..."
+SERVER_PIDFILE="$MODDIR/boot_server.pid"
+
+is_our_server_pid() {
+    PID="$1"
+    case "$PID" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ -r "/proc/$PID/cmdline" ] || return 1
+    CMDLINE="$(tr '\000' ' ' < "/proc/$PID/cmdline" 2>/dev/null)"
+    case "$CMDLINE" in
+        "$MODDIR/boot_server"|"$MODDIR/boot_server "*) return 0 ;;
+    esac
+    return 1
+}
+
+stop_owned_server_pid() {
+    PID="$1"
+    is_our_server_pid "$PID" || return 1
+    log_msg "Stopping previous Boot Creator server process: $PID"
+    kill "$PID" 2>/dev/null || true
+    WAIT_COUNT=0
+    while kill -0 "$PID" 2>/dev/null && [ "$WAIT_COUNT" -lt 10 ]; do
+        sleep 0.1
+        WAIT_COUNT=$((WAIT_COUNT + 1))
+    done
+    if kill -0 "$PID" 2>/dev/null; then
+        kill -9 "$PID" 2>/dev/null || true
+    fi
+    return 0
+}
+
+if [ -f "$SERVER_PIDFILE" ]; then
+    OLD_SERVER_PID="$(cat "$SERVER_PIDFILE" 2>/dev/null)"
+    stop_owned_server_pid "$OLD_SERVER_PID" || true
+fi
+
+# Catch a pre-pidfile BAS instance without ever using a blind killall.
+for PROC_CMDLINE in /proc/[0-9]*/cmdline; do
+    [ -r "$PROC_CMDLINE" ] || continue
+    PROC_PID="${PROC_CMDLINE#/proc/}"
+    PROC_PID="${PROC_PID%/cmdline}"
+    [ "$PROC_PID" = "$$" ] && continue
+    stop_owned_server_pid "$PROC_PID" || true
+done
+rm -f "$SERVER_PIDFILE"
+
+log_msg "Starting Companion: loopback-only HTTP 127.0.0.1:4040 for Android callbacks; network HTTPS :4041 only..."
 chmod 755 "$MODDIR/boot_server"
 nohup "$MODDIR/boot_server" > /dev/null 2>&1 &
+SERVER_PID=$!
+printf '%s\n' "$SERVER_PID" > "$SERVER_PIDFILE"
+sleep 1
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    rm -f "$SERVER_PIDFILE"
+    log_msg "Error: Companion process exited during startup. Loopback port 4040 may already be in use; refusing blind process termination."
+    exit 0
+fi
 
-log_msg "All set. Waiting for requests from the website."
+log_msg "Companion running. Remote website access requires HTTPS :4041; confirm TLS identity in local WebUI."

@@ -18,6 +18,15 @@ fi
 
 APPLIED=0
 PRIMARY_APPLIED=""
+ACTIVE_TARGET_TMP=""
+
+cleanup_target_tmp() {
+    if [ -n "$ACTIVE_TARGET_TMP" ]; then
+        rm -f "$ACTIVE_TARGET_TMP"
+        ACTIVE_TARGET_TMP=""
+    fi
+}
+trap cleanup_target_tmp EXIT HUP INT TERM
 
 while IFS= read -r TARGET_PATH || [ -n "$TARGET_PATH" ]; do
     [ -n "$TARGET_PATH" ] || continue
@@ -33,24 +42,35 @@ while IFS= read -r TARGET_PATH || [ -n "$TARGET_PATH" ]; do
         exit 1
     fi
 
-    rm -f "$TARGET_FILE"
+    TARGET_TMP="$TARGET_FILE.tmp.$$"
+    rm -f "$TARGET_TMP"
+    ACTIVE_TARGET_TMP="$TARGET_TMP"
+
     if [ -z "$PRIMARY_APPLIED" ]; then
-        if ! cp "$NEW_ZIP" "$TARGET_FILE"; then
-            echo "Error: Could not copy boot animation."
+        if ! cp "$NEW_ZIP" "$TARGET_TMP"; then
+            echo "Error: Could not stage boot animation."
             exit 1
         fi
-        PRIMARY_APPLIED="$TARGET_FILE"
     else
-        if ! ln "$PRIMARY_APPLIED" "$TARGET_FILE" 2>/dev/null; then
-            if ! cp "$PRIMARY_APPLIED" "$TARGET_FILE"; then
-                echo "Error: Could not create boot animation target."
+        if ! ln "$PRIMARY_APPLIED" "$TARGET_TMP" 2>/dev/null; then
+            if ! cp "$PRIMARY_APPLIED" "$TARGET_TMP"; then
+                echo "Error: Could not stage boot animation target."
                 exit 1
             fi
         fi
     fi
 
-    chmod 644 "$TARGET_FILE" 2>/dev/null
-    chcon u:object_r:system_file:s0 "$TARGET_FILE" 2>/dev/null
+    chmod 644 "$TARGET_TMP" 2>/dev/null
+    chcon u:object_r:system_file:s0 "$TARGET_TMP" 2>/dev/null
+    if ! mv -f "$TARGET_TMP" "$TARGET_FILE"; then
+        echo "Error: Could not commit boot animation target."
+        exit 1
+    fi
+    ACTIVE_TARGET_TMP=""
+
+    if [ -z "$PRIMARY_APPLIED" ]; then
+        PRIMARY_APPLIED="$TARGET_FILE"
+    fi
     APPLIED=1
 done < "$CACHE_FILE"
 

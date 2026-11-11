@@ -7,11 +7,16 @@ ENV_FILE="$MODDIR/.paths_environment"
 OLD_LIST="$MODDIR/.paths-old.$$"
 NEW_LIST="$MODDIR/.paths-new.$$"
 CURRENT_ZIP="$MODDIR/.paths-current.$$.zip"
+ACTIVE_TARGET_TMP=""
 
 . "$MODDIR/path_utils.sh" || exit 1
 
 cleanup() {
     rm -f "$OLD_LIST" "$NEW_LIST" "$CURRENT_ZIP" "$CACHE_FILE.tmp.$$"
+    if [ -n "$ACTIVE_TARGET_TMP" ]; then
+        rm -f "$ACTIVE_TARGET_TMP"
+        ACTIVE_TARGET_TMP=""
+    fi
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -52,15 +57,24 @@ if [ -f "$CURRENT_ZIP" ]; then
         TARGET_DIR=$(dirname "$TARGET_PATH")
         TARGET_FILE="$MODDIR$TARGET_PATH"
         mkdir -p "$MODDIR$TARGET_DIR" || exit 1
-        rm -f "$TARGET_FILE"
+        TARGET_TMP="$TARGET_FILE.tmp.$$"
+        rm -f "$TARGET_TMP"
+        ACTIVE_TARGET_TMP="$TARGET_TMP"
+
         if [ -z "$PRIMARY_APPLIED" ]; then
-            cp -f "$CURRENT_ZIP" "$TARGET_FILE" || exit 1
-            PRIMARY_APPLIED="$TARGET_FILE"
-        elif ! ln "$PRIMARY_APPLIED" "$TARGET_FILE" 2>/dev/null; then
-            cp -f "$PRIMARY_APPLIED" "$TARGET_FILE" || exit 1
+            cp -f "$CURRENT_ZIP" "$TARGET_TMP" || exit 1
+        elif ! ln "$PRIMARY_APPLIED" "$TARGET_TMP" 2>/dev/null; then
+            cp -f "$PRIMARY_APPLIED" "$TARGET_TMP" || exit 1
         fi
-        chmod 644 "$TARGET_FILE" 2>/dev/null
-        chcon u:object_r:system_file:s0 "$TARGET_FILE" 2>/dev/null
+
+        chmod 644 "$TARGET_TMP" 2>/dev/null
+        chcon u:object_r:system_file:s0 "$TARGET_TMP" 2>/dev/null
+        mv -f "$TARGET_TMP" "$TARGET_FILE" || exit 1
+        ACTIVE_TARGET_TMP=""
+
+        if [ -z "$PRIMARY_APPLIED" ]; then
+            PRIMARY_APPLIED="$TARGET_FILE"
+        fi
     done < "$CACHE_FILE"
 fi
 
